@@ -1,0 +1,13 @@
+<?xml version="1.0" ?>
+<robot name="rs005l" xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:include filename="$(find kawasaki)/urdf/rs005l_macro.xacro" />
+  <xacro:rs005l prefix="" />
+
+  <link name="world" />
+  <joint name="joint_w" type="fixed">
+    <parent link="world" />
+	<child link="base_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+
+</robot>
