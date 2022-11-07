@@ -1,7 +1,7 @@
 <?xml version="1.0" ?>
 <robot name="bx165l" xmlns:xacro="http://ros.org/wiki/xacro">
   <xacro:include filename="$(find kawasaki)/urdf/bx165l_macro.xacro" />
-  <xacro:rs005l prefix="" />
+  <xacro:bx165l prefix="" />
 
   <link name="world" />
   <joint name="joint_w" type="fixed">
