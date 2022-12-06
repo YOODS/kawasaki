@@ -131,7 +131,7 @@
       <parent link="${prefix}link_3_u"/>
       <child link="${prefix}link_4_r"/>
       <origin xyz="0 1250 230" rpy="0 0 0" />
-      <axis xyz="0 0 1" />
+      <axis xyz="0 1 0" />
       <limit lower="${radians(-210)}" upper="${radians(210)}" effort="1000.0" velocity="${radians(170)}"/>
     </joint>
     <joint name="${prefix}joint_5_b" type="revolute">
@@ -145,11 +145,11 @@
       <parent link="${prefix}link_5_b"/>
       <child link="${prefix}link_6_t"/>
       <origin xyz="0 225 0" rpy="0 0 0" />
-      <axis xyz="0 0 1" />
+      <axis xyz="0 1 0" />
       <limit lower="${radians(-210)}" upper="${radians(210)}" effort="1000.0" velocity="${radians(280)}"/>
     </joint>
     <joint name="${prefix}joint_6_t-tool0" type="fixed">
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="0 0 0" rpy="${radians(-90)} 0 0"/>
       <parent link="${prefix}link_6_t"/>
       <child link="${prefix}tool0"/>
     </joint>
