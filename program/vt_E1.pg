@@ -1,0 +1,1036 @@
+.***************************************************************************
+.*=== ＡＳ グループ ===    : ASE_010100W31 2014/09/18 17:31
+.*ユーザIF AS              : UASE010100W31 2014/09/18 17:31
+.*ユーザIF TP              : UTPE010100W31 2014/09/18 17:30
+.*アーム制御 AS            : AASE010100W31 2014/09/18 17:31
+.*ユーザIF AS メッセージファイル    : MASE0100W31JP 2014/09/18 17:27
+.*ユーザIF TP メッセージファイル    : MTPE0100W31JP 2014/09/18 17:27
+.*アームデータファイル     : ARME010100W31 2014/09/18 17:30
+.*カーネル                 : _KNL101900000 2012/07/13
+.*ドライバー               : _DRV103500000 2013/03/08
+.*RFS                      : _RFS100800100 2012/07/27
+.*=== サーボ グループ ===  : SVE_08000003G 2014/06/24 15:10
+.*アーム制御 サーボ        : ASVE08000003G 2014/06/24 15:03
+.*サーボデータファイル     : ASPE08000003G 2014/06/24 15:04
+.*アーム制御 サーボFPGA    : ASFE080000007 2013/11/29 18:48
+.*
+.*CPUボードタイプ          : 1VA
+.*=== WEBサーバー ===      : WBE_000000005
+.*   [出荷時設定データ] 
+.*出荷時設定データはありません 
+.***************************************************************************
+.NETCONF     192.168.32.112,"timesys-",255.255.255.0,192.168.32.250,0.0.0.0,0.0.0.0," "
+.NETCONF2     192.168.11.2,255.255.255.0,0.0.0.0
+.PROGRAM pc3_handshake(.sig_no) #3973
+; FUNCTION: ハンドシェイク待ち[PC3]
+; NOTE    : ver1.0.0[12/10/18]
+  WHILE SIG(-.sig_no) DO
+    TWAIT ascycle ;                           フラグ(信号)ＯＮ待ち
+  END
+  SIGNAL -.sig_no ;                           フラグ(信号)ＯＦＦ
+.END
+.PROGRAM pc3_tcp_recv(.tcp_sock,.timeout) #466
+; FUNCTION: TCP/IP通信 受信
+; NOTE    : ver1.0.0[12/10/19]
+; TCP_RECV 実行結果,ｿｹｯﾄID,受信文字列変数配列,配列数,ﾀｲﾑｱｳﾄ時間,1要素長
+  TCP_RECV .vstatus_recv,.tcp_sock,.$rcv_buf[0],vrecv_num,.timeout,vrecv_str_num
+  IF .vstatus_recv<0 THEN
+    PRINT /X2,"!!TCP_RECV error in pc3_tcp_recv : ",/I6,.vstatus_recv
+    CALL pc3_vcom_error(verr_recv,"TCP Recv Error")
+    v.com_error = verr_recv
+  ELSE
+    IF vrecv_num>0 THEN
+      FOR .i = 0 TO vrecv_num-1
+        IF vcontrol_char<0 THEN
+          $vrecv_data[.i] = .$rcv_buf[.i]
+        ELSE
+          $vrecv_data[.i] = $DECODE(.$rcv_buf[.i],$CHR(vcontrol_char),0); 制御文字削除
+        END
+      END
+      IF tcp_debug==1 THEN
+        PRINT /X2,">>TCP_RECV OK : [",$vrecv_data[0],"]"
+      END
+    ELSE
+      PRINT /X2,"TCP_RECV error in TCP_RECV"
+    END
+  END
+.END
+.PROGRAM pc3_tcp_sclose(.tcp_sock) #596
+; FUNCTION: TCP/IP通信 ソケットの切断（クライアント側）
+; NOTE    : ver1.0.0[12/10/19]
+close:
+  IF .tcp_sock>0 THEN ;                       ソケットがオープンしている場合
+    TCP_CLOSE .tcp_close,.tcp_sock;          ソケットクローズ処理
+    IF .tcp_close<0 THEN ;                    処理エラー
+      PRINT /X2,"TCP_CLOSE error : id=",/I2,.tcp_sock
+      TCP_CLOSE .ret,.tcp_sock;              強制終了
+      IF .ret<0 THEN
+        PRINT /X2,"!!TCP_CLOSE retry error : id=",/I2,.tcp_sock
+        v.com_error = 2
+      END
+    ELSE
+      IF tcp_debug==1 THEN
+        PRINT /X2,"<>TCP_CLOSE OK : [id=",/I2,.tcp_sock,"]"
+      END
+    END
+  END
+  .tcp_sock = -1
+.END
+.PROGRAM pc3_tcp_send(.tcp_sock,.timeout) #504
+; FUNCTION: TCP/IP通信 送信
+; NOTE    : ver1.0.0[12/10/19]
+  IF vcontrol_char<0 THEN
+    .$snd_buf[0] = $vsend_data[0]
+  ELSE
+    .$snd_buf[0] = $vsend_data[0]+$CHR(vcontrol_char); 制御文字追加
+  END
+; TCP_SEND 実行結果,ｿｹｯﾄID,送信文字列変数配列,配列数,ﾀｲﾑｱｳﾄ時間
+  TCP_SEND .vstatus_send,.tcp_sock,.$snd_buf[0],vsend_num,.timeout
+  IF .vstatus_send<0 THEN
+    PRINT /X2,"!!TCP_SEND error in pc3_tcp_send : ",/I6,.vstatus_send
+    CALL pc3_vcom_error(verr_send,"TCP Send Error")
+    v.com_error = verr_send
+  ELSE
+    IF tcp_debug==1 THEN
+      PRINT /X2,"<<TCP_SEND OK : [",$vsend_data[0],"]"
+    END
+  END
+.END
+.PROGRAM pc3_tcp_sopen(.tcp_port,.tcp_sock) #526
+; FUNCTION: TCP/IP通信 ソケットの生成（クライアント側）
+; NOTE    : ver1.0.0[13/01/31]
+  .err_count = 0;                            エラーカウンタ
+  .retry_count = 1;                          生成リトライ回数
+  .timeout_connect = 1;                      接続要求受信待ち(TCP_ACCEPT)監視待ち時間(秒)
+init:
+  .tcp_cnt = 0
+  .al_open = 0;                              ソケットの状態
+; Stores the state of the socket in the variable specified by the parameter.
+; .tcp_cnt : Stores the number of sockets stored.
+; .port1[0] : Stores the port number of the socket in use.
+; .sock1[0] : Stores the socket ID of the socket in use.
+  TCP_STATUS .tcp_cnt,.port1[0],.sock1[0],.err1[0],.sub1[0],.$ip_add1[0]
+; If there is no Sockets
+  IF .tcp_cnt==0 GOTO connect
+; If there are Sockets
+  FOR .i = 0 TO .tcp_cnt-1
+    IF .port1[.i]==.tcp_port THEN
+      .tcp_sock = .sock1[.i]
+      IF sock_notclose==1 THEN
+        .al_open = 1
+        IF tcp_debug==1 THEN
+          PRINT "ALREADY OPEN-> Port:",.port1[.i]," Socket:",.sock1[.i]," IP:",.$ip_add1[.i]
+        END
+      ELSE
+        IF tcp_debug==1 THEN
+          PRINT "CLOSE-> Port:",.port1[.i]," Socket:",.sock1[.i]," IP:",.$ip_add1[.i]
+        END
+        CALL pc3_tcp_sclose(.tcp_sock);        ソケットクローズ
+      END
+    END
+  END
+  IF sock_notclose==0 THEN
+    .tcp_sock = -1;                            ソケット番号初期化
+  END
+connect:
+  IF .al_open==0 THEN
+; .tcp_sock : Specify a variable to store the execution results.
+; .tcp_port : port number (8192 ~ 65535)
+; vsend_ip[0] : Specify the name of an array variable that specifies 
+;               the IP address of the node to connect to.
+    TCP_CONNECT .tcp_sock,.tcp_port,vsend_ip[0],.timeout_connect
+  END
+; If the socket terminates normally, the socket ID number (0 or greater) is stored.
+  IF .tcp_sock<0 THEN
+    IF .err_count>=.retry_count THEN
+; X2 : insert 2 spaces
+      PRINT /X2,"!!TCP_CONNECT error in pc3_tcp_sopen : ",.tcp_sock
+      v.com_error = 2
+    ELSE
+      .err_count = .err_count+1
+      IF tcp_debug==1 THEN
+; I6 : print integer 6 characters
+        PRINT /X2,"TCP_CONNECT error : id=",/I6,.tcp_sock," err count=",/I1,.err_count
+      END
+      GOTO connect
+    END
+  ELSE
+    IF tcp_debug==1 THEN
+      PRINT /X2,"<>TCP_CONNECT OK : [port/",/I5,.tcp_port," socket/",/I2,.tcp_sock,"]"
+    END
+  END
+.END
+.PROGRAM pc3_vcom_ackchk(.$vack_data) #8
+; FUNCTION: ACK確認
+; NOTE    : ver1.0.0[12/11/22]
+  RETURN
+.END
+.PROGRAM pc3_vcom_decode(.$data) #52
+; FUNCTION: 文字列データ分解(区切り文字 [,])
+; NOTE    : ver1.0.0[12/10/18]
+  .$strings = .$data;                        文字列データ代入
+  IF .$strings=="" GOTO end;                 文字列データが無い為終了
+  .i = 0;                                    分解した個数クリア
+  DO ;                                        条件ループ開始
+    $vst[.i] = $DECODE(.$strings,",",0);     ","までの文字列を取り出す
+    IF .$strings=="" GOTO end;               文字列データが無くなれば終了
+    .$temp = $DECODE(.$strings,",",1);       ","を取り出す
+    .i = .i+1;                               分解した個数カウントアップ
+  UNTIL .$strings=="" ;                       文字列データが無くなるまで
+end:
+  vdecode_num = .i;                          分解した個数代入
+.END
+.PROGRAM pc3_vcom_error(.err,.$res) #49
+; FUNCTION: エラーコード＆内容セット[PC3]
+; NOTE    : ver1.0.0[14/02/24]
+  v.com_err = .err
+  $vcom_res = .$res
+  PRINT /X2,$vcom_res," in pc3_vcom_send : ",v.com_err;エラー内容表示
+  CALL pc3_vcom_log(1,.$res);                ログ保存
+  SIGNAL ox_com_ng;                     エラー信号ＯＮ
+.END
+.PROGRAM pc3_vcom_log(.class,.$string) #29577
+; FUNCTION: ログ作成[PC3]
+; NOTE    : ver1.0.0[14/02/24]
+  IF vlog==2 OR (vlog==1 AND .class<>0) THEN ;保存確認
+    .$log = $DATE(3)+" "+$TIME+" [pc3_vcom_send] "+$ENCODE(/I,v.com_err)+" : "+.$string;ログデータ作成
+    $vlog[1,vlog_cnt[1]] = .$log;            ログデータ保存
+    vlog_cnt[1] = vlog_cnt[1]+1;             ログカウンタカウントアップ
+    IF vlog_cnt[1]>vlog_max THEN ;            ログカウンタ上限超えの為リセット
+      vlog_cnt[1] = 1
+    END
+  END
+.END
+.PROGRAM pc3_vcom_send() #0
+; FUNCTION: UDP/IP通信 送信[PC3]
+; NOTE    : ver1.0.0[14/03/06]
+  v.com_err = verr_init;                     通信結果クリア(変数定義用)
+  $vcom_res = "";                            エラー内容クリア(変数定義用)
+  SIGNAL -ox_vcomm_comp,-ox_com_ng;     通信完了信号＆通信エラー信号ＯＦＦ
+  SIGNAL -ox_vcomm_start,-ox_vcomm_busy;     通信開始信号＆通信中信号ＯＦＦ
+  CALL pc3_vcom_log(0,"送信ＰＧ起動")
+  SIGNAL -ox_pc_start;                       ＰＣプログラム起動確認信号ＯＦＦ
+loop:
+  CALL pc3_vcom_log(0,"通信開始信号待ち...")
+  CALL pc3_handshake(ox_vcomm_start);        通信開始信号ＯＮ待ち(確認後信号ＯＦＦ)
+  IF SIG(ox_vsend_only) AND SIG(ox_vrecv_only) THEN
+    CALL pc3_vcom_error(verr_onlymode,"片方向通信モードエラー");片方向通信モードエラー
+    HALT ;                                    停止(片方向通信モードエラー)
+  END
+  CALL pc3_vcom_log(0,"通信開始")
+  SIGNAL ox_vcomm_busy;                      通信中信号ＯＮ
+  IF SIG(ox_vsend_only) GOTO start;          送信のみ信号ＯＮ時は受信ＰＧ起動確認なし
+  CALL pc3_vcom_log(0,"受信ＰＧ起動確認")
+  IF TASK(1004)<>1 THEN ;                     受信ＰＧ起動確認
+    CALL pc3_vcom_log(0,"受信ＰＧ起動実行")
+    SIGNAL ox_pc_start;                      ＰＣプログラム起動確認信号ＯＮ
+    PCEXECUTE 4: pc4_vcom_recv;              受信ＰＧ起動
+    CALL pc3_vcom_log(0,"受信ＰＧ起動完了待ち...")
+    CALL vchk_pc_start(.chk,1004);           受信ＰＧ[PC4]起動確認
+    IF .chk!=0 THEN
+      CALL pc3_vcom_error(verr_timeout3,"受信ＰＧ起動待ちタイムアウトエラー");受信ＰＧ待ちタイムアウトエラー
+      HALT ;                                  停止(受信ＰＧ起動待ちタイムアウトエラー)
+    END
+  END
+  CALL pc3_vcom_log(0,"受信ＰＧ起動確認完了")
+start:; 送受信開始
+  v.com_err = verr_init;                     通信結果クリア
+  $vcom_res = "";                            エラー内容クリア
+  IF SIG(ox_vsend_only) GOTO send;           送信のみ信号ＯＮ時は受信ＰＧ起動なし
+  SIGNAL -ox_vrecv_comp,ox_vrecv_start;      受信完了信号ＯＦＦ＆受信開始信号ＯＮ
+  CALL pc3_vcom_log(0,"受信開始待ち...")
+  CALL pc3_sig_change(.chk,-ox_vrecv_start,vhandshake_time);受信開始信号ＯＦＦ待ち
+  IF .chk!=0 THEN
+    CALL pc3_vcom_error(verr_timeout1,"受信開始待ちタイムアウトエラー");受信開始待ちタイムアウトエラー
+    HALT ;                                    停止(受信開始待ちタイムアウトエラー)
+  END
+  IF SIG(ox_vrecv_only) GOTO recv;           受信のみ信号ＯＮ時は送信なし
+send:; 送信
+  CALL pc3_vcom_log(0,"送信開始")
+  UDP_SENDTO .vstatus_send,vsend_ip[0],vsend_port,$vsend_data[0],vsend_num,vsend_timeout
+  IF .vstatus_send<>0 THEN ;                  送信ステータス確認
+    .$log = "送信エラー : "+$ENCODE(/I6,.vstatus_send)+" // "+$vsend_data[0]
+    CALL pc3_vcom_error(verr_send,.$log);    送信エラー
+    HALT ;                                    停止(送信エラー)
+  ELSE
+    .$log = "送信完了 ["+$ENCODE(/I2,vsend_num)+"] -> "+$vsend_data[0]
+    CALL pc3_vcom_log(0,.$log)
+  END
+  IF SIG(ox_vsend_only) GOTO end;            送信のみ信号ＯＮ時は受信完了待ちなし
+recv:; 受信
+  CALL pc3_vcom_log(0,"受信完了待ち...")
+  CALL pc3_sig_change(.chk,ox_vrecv_comp,vrecv_timeout+1);受信完了信号ＯＮ待ち
+  IF .chk!=0 THEN
+    IF v.com_err==verr_init THEN
+      CALL pc3_vcom_error(verr_timeout2,"受信完了待ちタイムアウトエラー : "+$vsend_data[0]);受信完了待ちタイムアウトエラー
+    END
+    HALT ;                                    停止(受信完了待ちタイムアウトエラー)
+  END
+end:; 通信完了処理
+  CALL pc3_vcom_log(0,"通信完了")
+  v.com_err = verr_ok
+  SIGNAL -ox_vcomm_busy,ox_vcomm_comp;       通信中信号ＯＦＦ＆通信完了信号ＯＮ
+  GOTO loop
+.END
+.PROGRAM s3_vcom_init() #107;通信初期設定
+; FUNCTION: ビジョン変数初期化
+; NOTE    :
+  IF EXISTREAL("tcp_debug")==0 THEN ;       バッグ用フラグが定義されているか確認
+    tcp_debug = 0;                           ない場合は作成
+  END
+  IF EXISTREAL("vlog")==0 THEN ;            ログ保存モードが定義されているか確認
+    vlog = 1;                                ログ保存モード[0:保存なし,1:エラーログ保存,2:全ログ保存]
+  END
+  vlog_max = 1000;                           ログ最大数
+  IF EXISTREAL("vlog_cnt[1]")==0 THEN ;     ログカウンタが定義されているか確認
+    vlog_cnt[1] = 1;                         ログカウンタ
+  END
+;
+  ascycle = 0.016;                           ASサイクル待ち時間
+  vrecv_port = 8888;                         受信ポート番号
+  vsend_port = 8888;                         送信ポート番号
+  vsend_ip[0] = 192;                         RoVI側IPアドレス
+  vsend_ip[1] = 168
+  vsend_ip[2] = 32;
+  vsend_ip[3] = 113;
+  vrecv_ip[0] = 192;                         ROBOT側IPアドレス
+  vrecv_ip[1] = 168;
+  vrecv_ip[2] = 32;
+  vrecv_ip[3] = 112;
+  vsend_num = 1;                             送信文字列数
+  vrecv_str_num = 100;                       受信文字列長
+  vcontrol_char = -1;                        送信文字列末尾の制御文字(<0:付加しない)
+  vsend_timeout = 0.5;                       送信タイムアウト時間(sec)
+  vack_timeout = 0;                          ＡＣＫタイムアウト時間(sec)
+  vrecv_timeout = 10;                         受信タイムアウト時間(sec)
+  vrecv_timeout = MAXVAL(vrecv_timeout,3);   受信タイムアウト最小値 3sec
+  sock_notclose = 0;                         毎回接続／切断しない
+  mes_no = 0;                                メイン画面番号
+  ox_vcomm_start = 2201;                     通信開始信号
+  ox_vcomm_busy = 2202;                      通信中信号
+  ox_vcomm_comp = 2203;                      通信完了信号
+  ox_vcar_ok = 333;                          車種照合完了信号
+  ox_vcar_ng = 334;                          車種照合エラー信号
+  ox_vis_cut = 602;                          rovi off 信号
+  ox_com_ng = 662;                           通信エラー信号
+  ox_vis_ng = 661;                           rovi 命令エラー信号
+  ox_vis_ok = 660;                           rovi 命令完了信号
+  ox_vrecv_start = 2205;                     受信開始信号
+  ox_vrecv_comp = 2206;                      受信完了信号
+  ox_pc_start = 2207;                        ＰＣプログラム起動確認信号
+  ox_vsend_only = 2208;                      通信時送信のみ(受信なし)信号
+  ox_vrecv_only = 2209;                      通信時受信のみ(送信なし)信号
+  ox_streaming_end = 2210;                   ロボット姿勢送信PCプログラム停止信号  
+  vpc_start_time = 2;                        ＰＣプログラム起動待ちタイムアウト(sec)
+  vpc_start_time = MAXVAL(vpc_start_time,2); ＰＣプログラム起動待ちタイムアウト最小値 2sec
+  vhandshake_time = 2;                       ハンドシェイクタイムアウト(sec)
+  vhandshake_time = MAXVAL(vhandshake_time,2);ハンドシェイクタイムアウト最小値 2sec
+  vretry_max = 1;                            リトライ回数
+  vretry_wait = 0.5;                         リトライ前の待ち時間(sec)
+  verr_ok = 0;                               通信結果(ＯＫ, "0"以外はＮＧ)
+  verr_onlymode = 88;                        通信結果(片方向通信モードエラー)
+  verr_unknown = 89;                         通信結果(不明なエラー)
+  verr_init = 90;                            通信結果(初期値, 未計測)
+  verr_send = 91;                            通信結果(送信エラー)
+  verr_recv = 92;                            通信結果(受信エラー)
+  verr_timeout1 = 93;                        通信結果(受信開始待ちタイムアウトエラー)
+  verr_timeout2 = 94;                        通信結果(受信完了待ちタイムアウトエラー)
+  verr_timeout3 = 95;                        通信結果(受信ＰＧ起動待ちタイムアウトエラー)
+  verr_timeout4 = 96;                        通信結果(送信ＰＧ起動待ちタイムアウトエラー)
+  verr_timeout5 = 97;                        通信結果(通信完了(実行中)待ちタイムアウトエラー)
+  verr_timeout6 = 98;                        通信結果(送信ＰＧ実行待ちタイムアウトエラー)
+  verr_timeout7 = 99;                        通信結果(通信完了待ちタイムアウトエラー)
+  vis_init = -99999;                         検出結果初期値
+  vis_err_vid = 2;                           検出結果([2:画像取込エラー])
+.END
+.PROGRAM tcp_vcom_vision() #0
+; FUNCTION: TCP/IP通信(ｸﾗｲｱﾝﾄ) 送受信[PC3]
+; NOTE    : ver1.0.0[13/02/08]
+  v.com_error = verr_init ;                          通信結果クリア(変数定義用)
+  $vcom_res = "";                                    エラー内容クリア(変数定義用)
+  CALL s3_vcom_init;                                 ビジョン変数初期化
+  CALL pc3_vcom_log(0,"通信ＰＧ起動")
+  SIGNAL -ox_com_ng
+  SIGNAL -ox_vcomm_start,-ox_vcomm_busy,-ox_vcomm_comp ; 通信開始信号＆通信中信号＆通信完了信号ＯＦＦ
+  SIGNAL -ox_pc_start ;                                  ＰＣプログラム起動確認信号ＯＦＦ
+loop:
+  CALL pc3_vcom_log(0,"通信開始信号待ち...")
+  CALL pc3_handshake(ox_vcomm_start)
+  CALL pc3_vcom_log(0,"通信開始")
+  SIGNAL ox_vcomm_busy;                      通信中信号ＯＮ
+  v.com_error = verr_init;                          通信結果クリア
+  $vcom_res = "";                            エラー内容クリア
+res_open:
+  IF vsend_port==vrecv_port GOTO open
+  CALL pc3_vcom_log(0,"ソケットオープン開始[結果受信用]")
+  CALL pc3_tcp_sopen(vrecv_port,vtcp_res_sock);TCP/IP ソケットオープン
+  IF v.com_error<>verr_init GOTO res_close;         ソケット異常時
+  CALL pc3_vcom_log(0,"ソケットオープン完了[結果受信用]")
+open:
+  CALL pc3_vcom_log(0,"ソケットオープン開始[送受信用]")
+  CALL pc3_tcp_sopen(vsend_port,vtcp_sock);  TCP/IP ソケットオープン
+  IF v.com_error<>verr_init GOTO close;             ソケット異常時
+  CALL pc3_vcom_log(0,"ソケットオープン完了[送受信用]")
+send:
+  IF SIG(ox_vrecv_only) GOTO recv
+  IF vsend_timeout<=0 GOTO ack
+  CALL pc3_vcom_log(0,"データ送信開始")
+  CALL pc3_tcp_send(vtcp_sock,vsend_timeout);TCP/IP データ送信
+  IF v.com_error<>verr_init GOTO close;             送信異常時
+  CALL pc3_vcom_log(0,"データ送信完了")
+ack:
+  IF vack_timeout<=0 GOTO recv
+  CALL pc3_vcom_log(0,"ACK受信待ち開始")
+  CALL pc3_tcp_recv(vtcp_sock,vack_timeout); TCP/IP ACK受信
+  IF v.com_error<>verr_init GOTO close;             受信異常時
+  CALL pc3_vcom_ackchk($vrecv_data[0])
+  IF v.com_error<>verr_init GOTO close
+  CALL pc3_vcom_log(0,"ACK受信完了")
+  TWAIT 0.032
+recv:
+  IF vrecv_timeout<=0 OR vsend_port!=vrecv_port GOTO res_recv
+  CALL pc3_vcom_log(0,"データ受信待ち開始")
+  CALL pc3_tcp_recv(vtcp_sock,vrecv_timeout); TCP/IP データ受信
+  CALL pc3_vcom_log(0,"データ受信完了")
+res_recv:
+  IF vrecv_timeout<=0 OR vsend_port==vrecv_port GOTO close
+  CALL pc3_vcom_log(0,"データ受信待ち開始[結果受信用]")
+  CALL pc3_tcp_recv(vtcp_res_sock,vrecv_timeout); TCP/IP データ受信
+  CALL pc3_vcom_log(0,"データ受信完了[結果受信用]")
+close:
+  IF sock_notclose==0 THEN
+    CALL pc3_vcom_log(0,"ソケットクローズ開始")
+    CALL pc3_tcp_sclose(vtcp_sock);            TCP/IP ソケットクローズ
+    CALL pc3_vcom_log(0,"ソケットクローズ完了")
+  END
+res_close:
+  IF vsend_port==vrecv_port GOTO result
+  IF sock_notclose==0 THEN
+    CALL pc3_vcom_log(0,"ソケットクローズ開始[結果受信用]")
+    CALL pc3_tcp_sclose(vtcp_res_sock);        TCP/IP ソケットクローズ
+    CALL pc3_vcom_log(0,"ソケットクローズ完了[結果受信用]")
+  END
+result:; 通信結果確認
+  IF v.com_error<>verr_init GOTO error
+  GOTO end
+error:; エラー処理
+  SIGNAL ox_com_ng;                     通信エラー信号ＯＮ
+  PRINT "通信エラー in tcp_vcom_vision"
+  HALT ;                                      停止
+end:; 通信完了処理
+  v.com_error = verr_ok;                           通信結果ＯＫ
+  SIGNAL -ox_vcomm_busy,ox_vcomm_comp;       通信中信号ＯＦＦ＆通信完了信号ＯＮ
+  GOTO loop
+.END
+.PROGRAM vchk_pc_start(.res,.task_no) #140
+; FUNCTION: ＰＣプログラム起動確認
+; NOTE    : ver1.0.0[12/10/18]
+  .res = 0
+  UTIMER @vtime_vchk_pc = 0;                         TIMERーリセット
+  DO ;                                        条件ループ開始
+    IF TASK(.task_no)==1 GOTO next
+    TWAIT ascycle;                           ＰＣプログラム起動待ち
+  UNTIL UTIMER(@vtime_vchk_pc)>=vpc_start_time ;     タイムアウトするまで
+next:
+  DO ;                                        条件ループ開始
+    IF SIG(-ox_pc_start) GOTO end
+    TWAIT ascycle;                           ＰＣプログラム起動確認信号ＯＦＦ待ち
+  UNTIL UTIMER(@vtime_vchk_pc)>=vpc_start_time ;     タイムアウトするまで
+  .res = -1
+end:
+.END
+.PROGRAM vchk_sig_change(.res,.sig_no,.timeout) #63
+; FUNCTION: タイムアウト付き信号状態変更待ち
+; NOTE    : ver1.0.0[12/10/18]
+; .sig_no is OFF
+  .res = 0
+  UTIMER @vtime_vchk_sig = 0;                         TIMERーリセット
+  DO ;                                        条件ループ開始
+    IF SIG(.sig_no) GOTO end
+    TWAIT ascycle;                           信号の状態変更待ち
+  UNTIL UTIMER(@vtime_vchk_sig)>=.timeout ;           タイムアウトするまで
+  .res = -1
+end:
+.END
+.PROGRAM vinit(.send_timeout,.ack_timeout,.recv_timeout) #66
+; FUNCTION: ビジョン計測結果クリア＆通信タイムアウト設定
+; NOTE    : ver1.0.0[13/02/27]
+  vsend_timeout = .send_timeout;             送信タイムアウト時間(sec)
+  vack_timeout = .ack_timeout;              ＡＣＫタイムアウト時間(sec)
+  vrecv_timeout = .recv_timeout;             受信タイムアウト時間(sec)
+  $vres = ""
+  v.err = 90;                                計測結果クリア[90:未計測, 0:OK, 0<>:NG]
+  SIGNAL -ox_com_ng;                    ※メインＰＧでエラー信号を使用する場合はここでリセットしない※
+.END
+.PROGRAM vis_tcp(.send_timeout,.ack_timeout,.recv_timeout) #63
+; FUNCTION: ビジョン装置へ指令を送信
+; NOTE    : ver1.0.0[13/02/27]
+; check program execution state
+; return 1 means the PC program is during execution
+  IF TASK(1005)<>1 THEN ;                     送受信ＰＧ起動確認
+    IF EXISTREAL("vlog")==0 THEN ;          変数が定義されているか確認
+      CALL s3_vcom_init
+    END
+    SIGNAL ox_pc_start;                      ＰＣプログラム起動確認信号ＯＮ
+    PCEXECUTE 5: tcp_vcom_vision;            送受信ＰＧ起動
+    CALL vchk_pc_start(.chk,1005)
+    IF .chk!=0 THEN
+      CALL vset_error(verr_timeout4,"Timeout","送信ＰＧ起動待ちタイムアウトエラー in vis");送信ＰＧ起動待ちタイムアウトエラー
+      RETURN ;                                送信ＰＧ起動待ちタイムアウトエラー)
+    END
+  END
+  WHILE SIG(ox_vcomm_busy) DO
+    TWAIT ascycle;                           通信中信号ＯＦＦ待ち
+  END
+  vsend_timeout = .send_timeout;             送信タイムアウト時間(sec)
+  vack_timeout = .ack_timeout;              ＡＣＫタイムアウト時間(sec)
+  vrecv_timeout = .recv_timeout;             受信タイムアウト時間(sec)
+  CALL vinit(.send_timeout,.ack_timeout,.recv_timeout); 初期化
+  SIGNAL ox_vcomm_start;                     通信開始信号ＯＮ
+  CALL vchk_sig_change(.chk,-ox_vcomm_start,vpc_start_time)
+  IF .chk!=0 THEN
+    CALL vset_error(verr_timeout4,"Timeout","vchk_sig_change エラー in vis");送信ＰＧ起動待ちタイムアウトエラー
+    HALT ;                                    停止(送信ＰＧ実行待ちタイムアウトエラー)
+  END
+.END
+.PROGRAM vis_wait_tcp() #54
+; FUNCTION: ビジョン装置から結果を受信
+; NOTE    : ver1.0.0[13/02/27]
+  .vcomm_timeout = vsend_timeout+vack_timeout+vrecv_timeout*2; 送受信タイムアウト時間設定(sec)
+; set user timer 
+; @ variable is integer variable 
+  UTIMER .@vcomm_time = 0;                   送受信 TIMERーリセット
+  DO ;                                        条件ループ開始
+    IF SIG(ox_com_ng) OR SIG(ox_vcomm_comp) GOTO end
+    TWAIT ascycle;                           通信完了信号ＯＮまたは通信エラー信号ＯＮ待ち
+  UNTIL UTIMER(.@vcomm_time)>=.vcomm_timeout ; タイムアウトするまで
+  SIGNAL -ox_vcomm_comp;                     通信完了信号ＯＦＦ
+; abort pc program 3 : tcp_vcom_vision()
+  PCABORT 3:                                                     ;                                通信プログラム強制停止
+  WAIT TASK(1003)<>1 ;                        通信プログラム停止待ち
+; Stops program execution. Re-execution will not be possible.
+  HALT
+end:
+  SIGNAL -ox_vcomm_comp;                     通信完了信号ＯＦＦ
+.END
+.PROGRAM vset_error(.err,.$res,.$print) #2
+; FUNCTION: エラーコード＆内容セット
+; NOTE    : ver1.0.0[13/02/08]
+  v.err = .err
+  $vres = .$res
+  PRINT /X2,.$print ;                         エラー内容表示
+  SIGNAL ox_com_ng ;                     エラー信号ＯＮ
+.END
+.PROGRAM rovi_capture() #22;撮影処理
+; FUNCTION: 撮影処理
+; NOTE    :
+;
+  .num = BITS(ox_vis_cut,1)
+  IF .num==1 THEN
+    GOTO end
+  END
+  SIGNAL -ox_com_ng,-ox_vcomm_comp,-ox_vis_ng,-ox_vis_ok
+  POINT .rbpos = HERE
+  DECOMPOSE .x[0] = .rbpos
+  FOR .i = 0 TO 5
+    $rbpos[.i] = $ENCODE(/F9.3,.x[.i])
+  END
+  $vsend_data[0] = "X1("+$rbpos[0]+","+$rbpos[1]+","+$rbpos[2]+","+$rbpos[3]+","+$rbpos[4]+","+$rbpos[5]+")";送信データ作成
+  PRINT $vsend_data[0]
+  CALL vis_tcp(vsend_timeout,vack_timeout,vrecv_timeout);送信開始
+  CALL vis_wait_tcp;                            受信待ち
+  IF v.com_error==verr_ok AND $vcom_res=="" THEN ; 通信ＯＫ
+    CALL pc3_vcom_decode($vrecv_data[0]);           文字列分解
+    SCASE $vst[0] OF
+     SVALUE "OK": ;                                 ビジョン計測ＯＫ
+      v.err = verr_ok
+      SIGNAL ox_vis_ok ;                        完了信号ＯＮ
+     SVALUE "NG": ;                                 ビジョン計測ＮＧ
+      v.err = VAL($vst[1]);                          エラーコード取得
+      PRINT /X2,"撮影ＮＧ : v.err = ",v.err
+      SIGNAL ox_vis_ng ;                        エラー信号ＯＮ
+     ANY : ;                                         不明なＮＧ
+      CALL vset_error(verr_unknown,"UnknownError","撮影ＮＧ : 不明なエラー in ROVI_CAPTURE")
+    END
+  ELSE ;                                            通信ＮＧ
+    v.err = v.com_error
+    $vres = $vcom_res
+  END
+end:
+.END
+.PROGRAM rovi_recipe(.$recipe) #5;レシピ読込処理
+; FUNCTION: レシピ読込処理
+; NOTE    :
+;
+  .num = BITS(ox_vis_cut,1)
+  IF .num==1 THEN
+    GOTO end
+  END
+  SIGNAL -ox_com_ng,-ox_vcomm_comp,-ox_vis_ng,-ox_vis_ok
+  $vsend_data[0] = "X3("+.$recipe+")";送信データ作成
+  CALL vis_tcp(vsend_timeout,vack_timeout,vrecv_timeout);送信開始
+  CALL vis_wait_tcp;                            受信待ち
+  IF v.com_error==verr_ok AND $vcom_res=="" THEN ; 通信ＯＫ
+    CALL pc3_vcom_decode($vrecv_data[0]);           文字列分解
+    SCASE $vst[0] OF
+     SVALUE "OK": ;                                 ビジョン計測ＯＫ
+      SIGNAL ox_vis_ok ;                        完了信号ＯＮ
+      v.err = verr_ok
+     SVALUE "NG": ;                                 ビジョン計測ＮＧ
+      v.err = VAL($vst[1]);                          エラーコード取得
+      PRINT /X3,"レシピ読込ＮＧ : v.err = ",v.err
+      SIGNAL ox_vis_ng ;                        エラー信号ＯＮ
+     ANY : ;                                         不明なＮＧ
+      CALL vset_error(verr_unknown,"UnknownError","レシピ読込ＮＧ : 不明なエラー in ROVI_RECIPE")
+    END
+  ELSE ;                                            通信ＮＧ
+    v.err = v.com_error
+    $vres = $vcom_res
+  END
+end:
+.END
+.PROGRAM rovi_reset() #44;データクリア
+; FUNCTION: データクリア処理
+; NOTE    :
+; Set status of external output signals and internal signals
+; ox_com_ng = 2104 : internal signal, communication error
+; ox_com_ng = 2103 : internal signal, communication complete
+  .num = BITS(ox_vis_cut,1)
+  IF .num==1 THEN
+    GOTO end
+  END
+  SIGNAL -ox_com_ng,-ox_vcomm_comp,-ox_vis_ng,-ox_vis_ok
+  $vsend_data[0] = "X0()";送信データ作成
+  CALL vis_tcp(vsend_timeout,vack_timeout,vrecv_timeout);送信開始
+  CALL vis_wait_tcp;                            受信待ち
+  IF v.com_error==verr_ok AND $vcom_res=="" THEN ; 通信ＯＫ
+    CALL pc3_vcom_decode($vrecv_data[0]);           文字列分解
+    SCASE $vst[0] OF
+     SVALUE "OK": ;                                 ビジョン計測ＯＫ
+      SIGNAL ox_vis_ok ;                        完了信号ＯＮ
+      v.err = verr_ok
+     SVALUE "NG": ;                                 ビジョン計測ＮＧ
+      v.err = VAL($vst[1]);                          エラーコード取得
+      PRINT /X2,"データクリアＮＧ : v.err = ",v.err
+      SIGNAL ox_vis_ng ;                        エラー信号ＯＮ
+     ANY : ;                                         不明なＮＧ
+      CALL vset_error(verr_unknown,"UnknownError","データクリアＮＧ : 不明なエラー in ROVI_RESET")
+    END
+  ELSE ;                                            通信ＮＧ
+    v.err = v.com_error
+    $vres = $vcom_res
+  END
+end:
+.END
+.PROGRAM rovi_solve(.&move) #6;データ解析処理
+; FUNCTION: データ解析処理
+; NOTE    :
+;
+  .num = BITS(ox_vis_cut,1)
+  IF .num==1 THEN
+    POINT .move = TRANS(0,0,0,0,0,0)
+    GOTO end
+  END
+  POINT .move = TRANS(vis_init,vis_init)
+  SIGNAL -ox_com_ng,-ox_vcomm_comp,-ox_vis_ng,-ox_vis_ok
+  $vsend_data[0] = "X2()";送信データ作成
+  CALL vis_tcp(vsend_timeout,vack_timeout,vrecv_timeout);送信開始
+  CALL vis_wait_tcp;                            受信待ち
+  IF v.com_error==verr_ok AND $vcom_res=="" THEN ; 通信ＯＫ
+    CALL pc3_vcom_decode($vrecv_data[0]);           文字列分解
+    SCASE $vst[0] OF
+     SVALUE "OK": ;                                 ビジョン計測ＯＫ
+      v.err = verr_ok
+      SIGNAL ox_vis_ok ;                        完了信号ＯＮ      
+      .vpos_x = VAL($vst[1])
+      .vpos_y = VAL($vst[2])
+      .vpos_z = VAL($vst[3])
+      .vpos_o = VAL($vst[4])
+      .vpos_a = VAL($vst[5])
+      .vpos_t = VAL($vst[6])
+      POINT .move = TRANS(.vpos_x,.vpos_y,.vpos_z,.vpos_o,.vpos_a,.vpos_t)
+     SVALUE "NG": ;                                 ビジョン計測ＮＧ
+      v.err = VAL($vst[1]);                          エラーコード取得
+      PRINT /X2,"データ解析ＮＧ : v.err = ",v.err
+      SIGNAL ox_vis_ng ;                        エラー信号ＯＮ
+     ANY : ;                                         不明なＮＧ
+      CALL vset_error(verr_unknown,"UnknownError","データ解析ＮＧ : 不明なエラー in ROVI_SOLVE")
+    END
+  ELSE ;                                            通信ＮＧ
+    v.err = v.com_error
+    $vres = $vcom_res
+  END
+end:
+.END
+.PROGRAM s3_main_test() #0; ビジョン動作プログラム
+; FUNCTION: ビジョン動作プログラム
+; NOTE    :
+;
+  $recipe = "kawasaki_test"
+  PAUSE ; X3コマンド送信
+  CALL rovi_recipe($recipe); レシピ選択
+  IF v.err<>0 THEN
+    GOTO end
+  END
+  PAUSE ; X0コマンド送信
+  CALL rovi_reset; データクリア
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;撮影位置に移動
+  JOINT SPEED5 ACCU1 TIMER5 TOOL8 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[11.295,-27.751,-131.21,7.2381,-64.601,74.606] ;
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  IF v.err<>0 THEN
+    GOTO end
+  END
+  PAUSE ; X2コマンド送信
+  .retry_num = 5
+  .i = 0
+retry:
+  CALL rovi_solve(&res); データ解析
+  IF v.err<>0 THEN
+    .i = .i+1
+    IF .i<.retry_num THEN
+      PRINT "認識NG",.i
+      GOTO retry
+    ELSE
+      PRINT "認識NG",.i
+      GOTO end
+    END
+  ELSE
+    PRINT "認識OK"
+  END
+  BASE res
+;教示位置に移動
+  JMOVE vt_test
+;作業終了
+  BASE NULL
+end:
+.END
+.PROGRAM s3_vcalib_auto() #0; キャリブレーション自動実行プログラム
+; FUNCTION: キャリブレーションプログラム
+; NOTE    :
+  PAUSE ; X0コマンド送信
+  CALL rovi_reset; データクリア
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ初期撮影位置に移動
+  JOINT SPEED5 ACCU1 TIMER0 TOOL8 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[-98.125,-27.337,-111.85,0.1954,-89.745,-80.029] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  IF v.err<>0 THEN
+    GOTO end
+  END
+  PAUSE ; X2コマンド送信
+  CALL rovi_solve(&calib); データ解析
+  IF v.err<>0 THEN
+    PRINT "認識NG"
+    GOTO end
+  ELSE
+    PRINT "認識OK"
+  END
+  .satsuei = 12
+  FOR .count = 1 TO .satsuei
+    JMOVE calib
+    TWAIT 0.5
+    PAUSE ; X1コマンド送信
+    CALL rovi_capture; 撮影開始
+    IF v.err<>0 THEN
+      GOTO end
+    END
+    PAUSE ; X2コマンド送信
+    CALL rovi_solve(&calib); データ解析
+    IF v.err<>0 THEN
+      PRINT "認識NG"
+      GOTO end
+    ELSE
+      PRINT "認識OK"
+    END
+  END
+end:
+.END
+.PROGRAM s3_vcalib_m() #0; キャリブレーション手動実行プログラム
+; FUNCTION: キャリブレーションプログラム
+; NOTE    :
+;  ALIGN;   [20200721]コメントアウトしてみる
+;
+  PAUSE ; X0コマンド送信
+  CALL rovi_reset; データクリア
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ初期位置
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[11.293,-27.751,-131.21,7.2386,-64.6,74.607] ;
+;キャリブ1点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[11.293,-27.751,-131.21,7.2386,-64.6,74.607] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ2点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[-23.186,-25.656,-130.27,-19.283,-69.598,115.25] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ3点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[40.646,-13.104,-121.67,22.56,-73.765,42.379] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ4点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[7.4352,-51.858,-141.71,2.6887,-69.413,79.914] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ5点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[5.1887,10.84,-97.551,0.30905,-81.24,82.922] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ6点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[28.235,22.473,-83.635,15.086,-92.387,56.538] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ7点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[-16.157,14.245,-93.764,-9.8363,-85.457,108.12] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ8点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[45.73,-31.885,-134,23.142,-77.744,46.903] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ9点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[29.56,-7.7611,-116.85,15.57,-74.949,65.097] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ10点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[9.4138,-18.229,-124.87,6.2953,-69.253,56.703] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ11点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[15.649,-15.825,-123.11,7.5558,-73.183,18.376] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ12点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[14.549,-17.448,-124.31,1.4345,-66.029,102.25] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+;キャリブ13点目
+  JOINT SPEED9 ACCU1 TIMER0 TOOL1 WORK0 CLAMP1 (OFF,0,0,O) 2 (OFF,0,0,O) OX= WX= #[-4.7014,-19.163,-125.53,-4.3911,-67.698,148.91] ;
+  TWAIT 0.5
+  PAUSE ; X1コマンド送信
+  CALL rovi_capture; 撮影開始
+  TWAIT 1
+  IF v.err<>0 THEN
+    GOTO end
+  END
+end:
+.END
+.PROGRAM send_pos(.port,.sock_id,.timeout) #160
+; FUNCTION: Open Server
+; NOTE    : ver1.0.0[22/07/27]
+;Accept 接続確認
+  .i = 0
+  .sock_id = -1
+  WHILE .sock_id<0 DO
+    TCP_ACCEPT .sock_id,.port,30,vsend_ip[0]
+    PRINT "ACCEPTED"
+    IF .sock_id<0 THEN
+      .i = .i+1
+      PRINT "ACCEPT Failed",.i
+      IF .i>10 THEN
+        PRINT "ACCEPT Failed : END PG"
+        GOTO end
+      END
+    END
+  END
+loop:
+  TWAIT 0.1
+  POINT .#rbjoint = HERE
+  DECOMPOSE .x[0] = .#rbjoint
+  FOR .i = 0 TO 5
+    $rbjoint[.i] = $ENCODE(/F9.3,.x[.i])
+  END
+  .$joint = "J("+$rbjoint[0]+","+$rbjoint[1]+","+$rbjoint[2]+","+$rbjoint[3]+","+$rbjoint[4]+","+$rbjoint[5]+")";送信データ作成
+  POINT .rbxyz = HERE
+  DECOMPOSE .x[0] = .rbxyz
+  FOR .i = 0 TO 5
+    $rbxyz[.i] = $ENCODE(/F9.3,.x[.i])
+  END
+  .$xyz = "P("+$rbxyz[0]+","+$rbxyz[1]+","+$rbxyz[2]+","+$rbxyz[3]+","+$rbxyz[4]+","+$rbxyz[5]+")";送信データ作成
+  $send_pos[0] = .$joint+.$xyz
+; TCP_SEND 実行結果,ｿｹｯﾄID,送信文字列変数配列,配列数,ﾀｲﾑｱｳﾄ時間
+  TCP_SEND .vstatus_send,.sock_id,$send_pos[0],1,.timeout
+  IF .vstatus_send<0 THEN
+    PRINT /X2,"!!TCP_SEND error in send_pos : ",/I6,.vstatus_send
+    GOTO end
+  ELSE
+    .num = BITS(ox_streaming_end,1)
+    IF .num==1 THEN
+      GOTO end
+    ELSE
+      GOTO loop
+    END
+;CALL pc3_tcp_sclose(.sock_id)
+  END
+end:
+  SIGNAL(-ox_streaming_end)
+  CALL pc3_tcp_sclose(.sock_id)
+  .i = 0
+  DO
+    TCP_END_LISTEN .res,.port;          LISTENクローズ処理
+    IF .res<0 THEN
+      .i = .i+1
+      IF .i>10 THEN
+        PRINT "TCP_END_LISTEN ERROR (1)"
+        GOTO end
+      END
+    END
+  UNTIL .res>=0
+.END
+.PROGRAM srv_open(.port,.sock_id) #176
+; FUNCTION: Open Server
+; NOTE    : ver1.0.0[22/07/27]
+;Listen 接続要求待ち
+listen:
+  .i = 0
+  .ret = -1
+  WHILE .ret<0 DO
+    tcp_status .cnt,.ports[0],.sock[0],.err[0],.sub[0],.$ip[0]
+    IF .cnt==0 THEN
+      TCP_LISTEN .ret,.port
+    ELSE
+      IF .ports[0]==0 THEN
+        TCP_LISTEN .ret,.port
+      ELSE
+        TCP_END_LISTEN .res,.port
+        TCP_LISTEN .ret,.port
+      END
+    END
+    PRINT "START LISTEN"
+    IF .ret<0 THEN
+      TWAIT 1
+      .i = .i+1
+      IF .i>10 THEN
+        PRINT "LISTEN Failed"
+        GOTO listen
+      END
+    END
+  END
+.END
+.PROGRAM streaming() #1
+; FUNCTION: Open Server
+; NOTE    : ver1.0.0[22/07/27]
+  CALL srv_open(9999,sock_ac_id)
+  CALL send_pos(9999,sock_ac_id,10)
+.END
+.PROGRAM autostart3.pc() #0
+; FUNCTION: Open Server
+; NOTE    : ver1.0.0[22/07/27]
+;open:
+  CALL srv_open(9999,sock_ac_id)
+  CALL send_pos(9999,sock_ac_id,10)
+;  GOTO open
+.END
+.PROGRAM Comment___ () ; Comments for IDE. Do not use.
+	; @@@ PROJECT @@@
+	; @@@ HISTORY @@@
+	; @@@ INSPECTION @@@
+	; @@@ PROGRAM @@@
+	; 0:pc3_handshake
+	; 0:pc3_tcp_recv
+	; 0:pc3_tcp_sclose
+	; 0:pc3_tcp_send
+	; 0:pc3_tcp_sopen
+	; 0:pc3_vcom_ackchk
+	; 0:pc3_vcom_decode
+	; 0:pc3_vcom_error
+	; 0:pc3_vcom_log
+	; 0:pc3_vcom_send
+	; 0:s3_vcom_init
+	; 0:tcp_vcom_vision
+	; 0:vchk_pc_start
+	; 0:vchk_sig_change
+	; 0:vinit
+	; 0:vis_tcp
+	; 0:vis_wait_tcp
+	; 0:vset_error
+	; 0:rovi_capture
+	; 0:rovi_recipe
+	; 0:rovi_reset
+	; 0:rovi_solve
+	; 0:s3_main_test
+	; 0:s3_vcalib_auto
+	; 0:s3_vcalib_m
+	; 0:send_pos
+	; 0:srv_open
+	; 0:streaming
+	; 0:autostart3.pc
+	; @@@ TRANS @@@
+	; @@@ JOINTS @@@
+	; @@@ REALS @@@
+	; @@@ STRINGS @@@
+	; @@@ INTEGER @@@
+	; @@@ SIGNALS @@@
+	; @@@ TOOLS @@@
+	; @@@ BASE @@@
+	; @@@ FRAME @@@
+	; @@@ BOOL @@@
+.END
